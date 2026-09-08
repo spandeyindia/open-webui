@@ -60,7 +60,7 @@
 	import { createNewNote, getPinnedNoteList, toggleNotePinnedStatusById } from '$lib/apis/notes';
 	import { updateUserSettings } from '$lib/apis/users';
 	import { createNoteHandler } from '$lib/components/notes/utils';
-	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import UserMenu from './Sidebar/UserMenu.svelte';
 	import ChatItem from './Sidebar/ChatItem.svelte';
@@ -963,14 +963,11 @@
 							<div
 								class="self-center flex size-[calc(30px*var(--app-text-scale,1))] items-center justify-center rounded-lg transition group-hover:bg-gray-100 dark:group-hover:bg-gray-900"
 							>
-								<!-- LICENSE covers this Open WebUI sidebar logo.
-							Do not alter, remove, obscure, or replace it except as LICENSE permits:
-							https://docs.openwebui.com/license. -->
-								<img
-									src="{WEBUI_BASE_URL}/static/favicon.png"
-									class="sidebar-new-chat-icon size-5 rounded-full group-hover:hidden"
-									alt=""
-								/>
+								<span class="sidebar-new-chat-icon flex size-5 items-center justify-center rounded-sm bg-[#c74634] group-hover:hidden" aria-label="Oracle">
+									<svg viewBox="0 0 64 32" class="h-3 w-4" aria-hidden="true">
+										<rect x="7" y="7" width="50" height="18" rx="9" fill="none" stroke="white" stroke-width="5" />
+									</svg>
+								</span>
 
 								<Sidebar className="size-4 hidden group-hover:flex" />
 							</div>
@@ -1149,26 +1146,19 @@
 						draggable="false"
 						on:click={newChatHandler}
 					>
-						<!-- LICENSE covers this Open WebUI sidebar logo.
-					Do not alter, remove, obscure, or replace it except as LICENSE permits:
-					https://docs.openwebui.com/license. -->
-						<img
-							crossorigin="anonymous"
-							src="{WEBUI_BASE_URL}/static/favicon.png"
-							class="sidebar-new-chat-icon size-5 rounded-full"
-							alt=""
-						/>
+						<span class="sidebar-new-chat-icon flex size-5 items-center justify-center rounded-sm bg-[#c74634]" aria-label="Oracle">
+							<svg viewBox="0 0 64 32" class="h-3 w-4" aria-hidden="true">
+								<rect x="7" y="7" width="50" height="18" rx="9" fill="none" stroke="white" stroke-width="5" />
+							</svg>
+						</span>
 					</a>
 
 					<a href="/" class="flex flex-1 px-0.5" on:click={newChatHandler}>
-						<!-- LICENSE covers this Open WebUI sidebar name.
-					Do not alter, remove, obscure, or replace it except as LICENSE permits:
-					https://docs.openwebui.com/license. -->
 						<div
 							id="sidebar-webui-name"
 							class=" self-center font-normal text-gray-700 dark:text-gray-200"
 						>
-							{$WEBUI_NAME}
+							JDE DevOps
 						</div>
 					</a>
 					<Tooltip

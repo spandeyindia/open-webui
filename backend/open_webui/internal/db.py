@@ -320,6 +320,19 @@ if SQLALCHEMY_DATABASE_URL.startswith('sqlite+sqlcipher://'):
 elif 'sqlite' in SQLALCHEMY_DATABASE_URL:
     engine = _create_engine(SQLALCHEMY_DATABASE_URL, connect_args={'check_same_thread': False})
 
+    def _load_sqlite_vec(dbapi_connection):
+        """Load sqlite-vec into a standard synchronous SQLite connection."""
+        # sqlite-vec is a connection-scoped loadable extension. Load it before
+        # exposing the connection so vec0 tables and vector functions are
+        # available to DbOps' local SQLite vector store.
+        import sqlite_vec
+
+        dbapi_connection.enable_load_extension(True)
+        try:
+            sqlite_vec.load(dbapi_connection)
+        finally:
+            dbapi_connection.enable_load_extension(False)
+
     def _apply_sqlite_pragmas(dbapi_connection):
         """Apply all configured SQLite PRAGMAs to a raw DBAPI connection."""
         # SQLite LIKE folds ASCII only; SQLAlchemy SQLite ILIKE compiles to lower(x) LIKE lower(?).
@@ -383,6 +396,7 @@ elif 'sqlite' in SQLALCHEMY_DATABASE_URL:
         cursor.close()
 
     def on_connect(dbapi_connection, connection_record):
+        _load_sqlite_vec(dbapi_connection)
         _apply_sqlite_pragmas(dbapi_connection)
 
     event.listen(engine, 'connect', on_connect)

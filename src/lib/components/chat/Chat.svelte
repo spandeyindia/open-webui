@@ -114,6 +114,7 @@
 	import DeleteConfirmDialog from '../common/ConfirmDialog.svelte';
 	import WebSearchConfirmDialog from '../common/ConfirmDialog.svelte';
 	import Placeholder from './Placeholder.svelte';
+	import JdeOpsHome from './JdeOpsHome.svelte';
 	import FilesOverlay from './MessageInput/FilesOverlay.svelte';
 	import NotificationToast from '../NotificationToast.svelte';
 	import Spinner from '../common/Spinner.svelte';
@@ -1034,6 +1035,12 @@
 					selectedToolIds = $settings.tools;
 				} else {
 					selectedToolIds = selectedToolIds.filter((id) => !id.startsWith('direct_server:'));
+				}
+
+				// DbOps monitoring history is deliberately read-only and is available
+				// in every chat so operational questions can use stored card results.
+				if ($tools.find((tool) => tool.id === 'dbops_monitoring_knowledge')) {
+					selectedToolIds = [...new Set([...selectedToolIds, 'dbops_monitoring_knowledge'])];
 				}
 
 				// Set Default Skills
@@ -4244,8 +4251,8 @@
 		? 'h-full'
 		: 'h-screen max-h-[100dvh]'} transition-width duration-200 ease-in-out {$showSidebar &&
 	!embedded
-		? '  md:max-w-[calc(100%-var(--sidebar-width))]'
-		: ' '} w-full max-w-full min-w-0 flex flex-col"
+		? ' md:max-w-[calc(100%-var(--sidebar-width))]'
+		: ''} w-full max-w-full min-w-0 flex flex-col"
 	id={chatContainerId}
 >
 	{#if !loading}
@@ -4364,10 +4371,15 @@
 							}}
 						/>
 					{/if}
+					{#if !embedded && !$selectedFolder && createMessagesList(history, history.currentId).length > 0}
+						<div class="absolute inset-0 z-0 overflow-auto opacity-30 pointer-events-none">
+							<JdeOpsHome />
+						</div>
+					{/if}
 					<div id="chat-pane" class="flex flex-col flex-auto z-10 w-full @container overflow-auto">
 						{#if ($settings?.landingPageMode === 'chat' && !$selectedFolder) || createMessagesList(history, history.currentId).length > 0}
 							<div
-								class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"
+								class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden bg-white/80 backdrop-blur-sm dark:bg-gray-900/80"
 								id="messages-container"
 								bind:this={messagesContainerElement}
 								on:scroll={(e) => {

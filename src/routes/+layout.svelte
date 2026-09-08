@@ -1402,7 +1402,7 @@
 
 {#if loaded}
 	{#if $isApp}
-		<div class="flex flex-row h-screen">
+		<div class="flex h-screen flex-row">
 			<AppSidebar />
 
 			<div class="w-full flex-1 max-w-[calc(100%-4.5rem)]">

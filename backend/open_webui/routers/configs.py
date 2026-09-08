@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import copy
+import asyncio
+import json
 import logging
-from typing import Optional
+import os
+import posixpath
+import socket
+import subprocess
+import tempfile
+import time
+from uuid import uuid4
+from typing import Literal, Optional
 
 import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse
 from mcp.shared.auth import OAuthMetadata
 from open_webui.config import BannerModel
 from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, AIOHTTP_CLIENT_TIMEOUT
@@ -32,7 +42,9 @@ from open_webui.utils.tools import (
     set_terminal_servers,
     set_tool_servers,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import text
+from open_webui.internal.db import get_async_db
 
 router = APIRouter()
 
@@ -76,6 +88,82 @@ SUBAGENTS_CONFIG_KEYS = {
     'SUBAGENTS_SYSTEM_PROMPT': 'subagents.system_prompt',
 }
 
+ORACLE_MONITOR_TARGETS_CONFIG_KEY = 'oracle_monitor.targets'
+ORACLE_LOG_DOWNLOADS: dict[str, dict[str, str]] = {}
+ORACLE_MONITOR_HISTORY_RETENTION_DAYS = 90
+
+
+ORACLE_MONITOR_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS oracle_monitor_history (
+    id TEXT PRIMARY KEY,
+    captured_at INTEGER NOT NULL,
+    captured_by TEXT,
+    report_type TEXT NOT NULL,
+    target_id TEXT,
+    target_name TEXT,
+    service_name TEXT,
+    protocol TEXT,
+    success INTEGER NOT NULL,
+    error_detail TEXT,
+    payload_json TEXT NOT NULL
+)
+"""
+
+
+async def _record_oracle_monitor_history(
+    report_type: str,
+    payload: dict,
+    user_id: str,
+    *,
+    target: dict | None = None,
+    error_detail: str | None = None,
+) -> None:
+    """Persist a non-secret operational snapshot for history and future chat retrieval."""
+    captured_at = int(time.time())
+    try:
+        async with get_async_db() as db:
+            await db.execute(text(ORACLE_MONITOR_HISTORY_DDL))
+            await db.execute(
+                text(
+                    'CREATE INDEX IF NOT EXISTS idx_oracle_monitor_history_lookup '
+                    'ON oracle_monitor_history (report_type, target_id, captured_at DESC)'
+                )
+            )
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO oracle_monitor_history (
+                        id, captured_at, captured_by, report_type, target_id, target_name,
+                        service_name, protocol, success, error_detail, payload_json
+                    ) VALUES (
+                        :id, :captured_at, :captured_by, :report_type, :target_id, :target_name,
+                        :service_name, :protocol, :success, :error_detail, :payload_json
+                    )
+                    """
+                ),
+                {
+                    'id': str(uuid4()),
+                    'captured_at': captured_at,
+                    'captured_by': user_id,
+                    'report_type': report_type,
+                    'target_id': target.get('id') if target else None,
+                    'target_name': target.get('name') if target else None,
+                    'service_name': target.get('service_name') if target else None,
+                    'protocol': target.get('protocol') if target else None,
+                    'success': 0 if error_detail else 1,
+                    'error_detail': error_detail,
+                    'payload_json': json.dumps(payload, default=str, separators=(',', ':')),
+                },
+            )
+            await db.execute(
+                text('DELETE FROM oracle_monitor_history WHERE captured_at < :oldest'),
+                {'oldest': captured_at - ORACLE_MONITOR_HISTORY_RETENTION_DAYS * 24 * 60 * 60},
+            )
+            await db.commit()
+    except Exception as exc:
+        # Monitoring itself must remain available if history persistence is unavailable.
+        log.warning('Unable to persist Oracle monitoring history: %s', exc)
+
 
 async def get_config_values(key_map: dict[str, str]) -> dict:
     values = await Config.get_many(*key_map.values())
@@ -84,6 +172,592 @@ async def get_config_values(key_map: dict[str, str]) -> dict:
 
 def config_updates(data: dict, key_map: dict[str, str]) -> dict:
     return {key_map[field]: value for field, value in data.items() if field in key_map}
+
+
+class OracleMonitorTarget(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=80)
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=1521, ge=1, le=65535)
+    protocol: Literal['TCP', 'TCPS'] = 'TCP'
+    service_name: str = Field(min_length=1, max_length=255)
+    username: str = Field(default='SYS', min_length=1, max_length=128)
+    password: str | None = Field(default=None, max_length=1024)
+    oracle_os_owner: str | None = Field(default=None, max_length=128)
+    oracle_os_password: str | None = Field(default=None, max_length=1024)
+    oracle_base: str | None = Field(default=None, max_length=1024)
+    connect_timeout_seconds: int = Field(default=5, ge=1, le=30)
+
+    @field_validator('username')
+    @classmethod
+    def require_sys_user(cls, value: str) -> str:
+        if value.strip().upper() != 'SYS':
+            raise ValueError('Oracle monitoring targets must use the SYS user')
+        return 'SYS'
+
+
+class OracleMonitorTargetsForm(BaseModel):
+    targets: list[OracleMonitorTarget] = Field(default_factory=list, max_length=100)
+
+
+class OracleSessionSelection(BaseModel):
+    inst_id: int = Field(ge=1)
+    sid: int = Field(ge=1)
+    serial_number: int = Field(ge=1)
+
+
+class OracleSessionKillRequest(BaseModel):
+    sessions: list[OracleSessionSelection] = Field(min_length=1, max_length=100)
+
+
+class OracleParameterFilter(BaseModel):
+    name_filter: str = Field(default='', max_length=200)
+
+
+class OracleTraceFileRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+
+def _public_oracle_target(target: dict) -> dict:
+    return {
+        'id': target['id'],
+        'name': target['name'],
+        'host': target['host'],
+        'port': target['port'],
+        'protocol': target.get('protocol', 'TCP'),
+        'service_name': target['service_name'],
+        'username': target.get('username', 'SYS'),
+        'oracle_os_owner': target.get('oracle_os_owner'),
+        'oracle_base': target.get('oracle_base'),
+        'connect_timeout_seconds': target['connect_timeout_seconds'],
+        'has_password': bool(target.get('password')),
+        'has_oracle_os_password': bool(target.get('oracle_os_password')),
+    }
+
+
+def _oracle_target_sort_key(target: dict) -> tuple[str, str, str]:
+    return (
+        str(target.get('name', target.get('database_name', ''))).casefold(),
+        str(target.get('service_name', '')).casefold(),
+        str(target.get('protocol', 'TCP')).casefold(),
+    )
+
+
+def _oracle_connect(target: dict):
+    """Open a direct TCP/TCPS SYSDBA connection for one configured target."""
+    import oracledb
+
+    password = decrypt_data(target['password'])
+    dsn = (
+        f"(DESCRIPTION=(ADDRESS=(PROTOCOL={target.get('protocol', 'TCP')})"
+        f"(HOST={target['host']})(PORT={target['port']}))"
+        f"(CONNECT_DATA=(SERVICE_NAME={target['service_name']})))"
+    )
+    return oracledb.connect(
+        user='SYS',
+        password=password,
+        dsn=dsn,
+        mode=oracledb.AUTH_MODE_SYSDBA,
+        tcp_connect_timeout=target['connect_timeout_seconds'],
+    )
+
+
+def _oracle_monitor_status(target: dict) -> dict:
+    """Run the network and database checks without exposing a stored secret."""
+    result = {
+        'id': target['id'],
+        'name': target['name'],
+        'host': target['host'],
+        'port': target['port'],
+        'protocol': target.get('protocol', 'TCP'),
+        'service_name': target['service_name'],
+        'listener_status': 'DOWN',
+        'database_status': 'DOWN',
+        'instance_name': None,
+        'instance_status': None,
+        'open_mode': None,
+        'database_role': None,
+        'version_full': None,
+        'startup_time': None,
+        'uptime': None,
+        'fra_available_mb': None,
+        'fra_available_pct': None,
+        'detail': None,
+    }
+    timeout = target['connect_timeout_seconds']
+
+    try:
+        with socket.create_connection((target['host'], target['port']), timeout=timeout):
+            result['listener_status'] = 'UP'
+    except OSError as exc:
+        result['detail'] = f'Listener connection failed: {str(exc)[:180]}'
+        return result
+
+    try:
+        with _oracle_connect(target) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        i.instance_name,
+                        i.status,
+                        i.version_full,
+                        TO_CHAR(i.startup_time, 'YYYY-MM-DD HH24:MI:SS') AS startup_time,
+                        EXTRACT(DAY FROM (SYSTIMESTAMP - CAST(i.startup_time AS TIMESTAMP))) || 'd ' ||
+                        EXTRACT(HOUR FROM (SYSTIMESTAMP - CAST(i.startup_time AS TIMESTAMP))) || 'h ' ||
+                        EXTRACT(MINUTE FROM (SYSTIMESTAMP - CAST(i.startup_time AS TIMESTAMP))) || 'm' AS uptime,
+                        ROUND(GREATEST(f.space_limit - f.space_used, 0) / 1024 / 1024, 2) AS fra_available_mb,
+                        ROUND(
+                            GREATEST(f.space_limit - f.space_used, 0) * 100 / NULLIF(f.space_limit, 0),
+                            2
+                        ) AS fra_available_pct,
+                        d.open_mode,
+                        d.database_role
+                    FROM v$instance i
+                    CROSS JOIN v$database d
+                    LEFT JOIN v$recovery_file_dest f ON 1 = 1
+                    """
+                )
+                row = cursor.fetchone()
+        result.update(
+            {
+                'database_status': 'UP',
+                'instance_name': row[0],
+                'instance_status': row[1],
+                'version_full': row[2],
+                'startup_time': row[3],
+                'uptime': row[4],
+                'fra_available_mb': row[5],
+                'fra_available_pct': row[6],
+                'open_mode': row[7],
+                'database_role': row[8],
+            }
+        )
+    except Exception as exc:
+        result['detail'] = f'Database connection/query failed: {str(exc)[:180]}'
+
+    return result
+
+
+ORACLE_CURRENT_USAGE_QUERY = """
+WITH session_banners AS (
+    SELECT
+        ci.inst_id,
+        ci.sid,
+        ci.serial#,
+        LISTAGG(ci.network_service_banner, ' | ')
+            WITHIN GROUP (ORDER BY ci.network_service_banner) AS banners
+    FROM gv$session_connect_info ci
+    GROUP BY ci.inst_id, ci.sid, ci.serial#
+)
+SELECT
+    s.inst_id,
+    s.sid,
+    s.serial# AS serial_number,
+    s.username,
+    s.status,
+    EXTRACT(DAY FROM (SYSTIMESTAMP - CAST(s.logon_time AS TIMESTAMP))) || 'd ' ||
+    EXTRACT(HOUR FROM (SYSTIMESTAMP - CAST(s.logon_time AS TIMESTAMP))) || 'h ' ||
+    EXTRACT(MINUTE FROM (SYSTIMESTAMP - CAST(s.logon_time AS TIMESTAMP))) || 'm' AS age,
+    s.service_name,
+    s.machine,
+    s.program,
+    s.logon_time,
+    CASE
+        WHEN LOWER(b.banners) LIKE '%tcp/ip with ssl%' THEN 'TCPS'
+        WHEN LOWER(b.banners) LIKE '%tcp/ip%' THEN 'TCP'
+        ELSE 'OTHER / REVIEW BANNER'
+    END AS transport,
+    s.sql_id,
+    s.prev_sql_id,
+    COALESCE(
+        (
+            SELECT DBMS_LOB.SUBSTR(cur.sql_fulltext, 32767, 1)
+            FROM gv$sql cur
+            WHERE cur.inst_id = s.inst_id
+              AND cur.sql_id = s.sql_id
+              AND ROWNUM = 1
+        ),
+        (
+            SELECT DBMS_LOB.SUBSTR(prev.sql_fulltext, 32767, 1)
+            FROM gv$sql prev
+            WHERE prev.inst_id = s.inst_id
+              AND prev.sql_id = s.prev_sql_id
+              AND ROWNUM = 1
+        )
+    ) AS last_sql
+FROM gv$session s
+LEFT JOIN session_banners b
+  ON b.inst_id = s.inst_id
+ AND b.sid = s.sid
+ AND b.serial# = s.serial#
+WHERE s.type = 'USER'
+  AND s.username IS NOT NULL
+ORDER BY transport, s.inst_id, s.sid
+"""
+
+
+def _oracle_current_usage(target: dict) -> dict:
+    """Execute the requested user-session transport report for one target."""
+    with _oracle_connect(target) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(ORACLE_CURRENT_USAGE_QUERY)
+            columns = [column[0].lower() for column in cursor.description]
+            rows = [dict(zip(columns, row, strict=True)) for row in cursor]
+
+    transports = {'TCP': 0, 'TCPS': 0, 'OTHER / REVIEW BANNER': 0}
+    statuses = {'ACTIVE': 0, 'INACTIVE': 0}
+    for row in rows:
+        transports[row['transport']] = transports.get(row['transport'], 0) + 1
+        statuses[row['status']] = statuses.get(row['status'], 0) + 1
+    return {
+        'target': _public_oracle_target(target),
+        'summary': {
+            'total_sessions': len(rows),
+            'active_sessions': statuses.get('ACTIVE', 0),
+            'inactive_sessions': statuses.get('INACTIVE', 0),
+            'tcp_sessions': transports.get('TCP', 0),
+            'tcps_sessions': transports.get('TCPS', 0),
+            'review_sessions': transports.get('OTHER / REVIEW BANNER', 0),
+        },
+        'rows': rows,
+    }
+
+
+def _oracle_current_usage_summary(target: dict) -> dict:
+    """Return a lightweight USER-session total for the home-page card."""
+    with _oracle_connect(target) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status, COUNT(*)
+                FROM gv$session
+                WHERE type = 'USER' AND username IS NOT NULL
+                GROUP BY status
+                """
+            )
+            counts = {status: count for status, count in cursor}
+    return {
+        'total_sessions': sum(counts.values()),
+        'active_sessions': counts.get('ACTIVE', 0),
+        'inactive_sessions': counts.get('INACTIVE', 0),
+    }
+
+
+def _oracle_display_value(value) -> str | None:
+    """Convert Oracle values to concise JSON-safe strings for the details views."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.hex().upper()
+    if hasattr(value, 'isoformat'):
+        try:
+            return value.isoformat(sep=' ')
+        except TypeError:
+            return value.isoformat()
+    return str(value)
+
+
+ORACLE_PARAMETER_TYPE_CATEGORIES = {
+    '1': 'Boolean',
+    '2': 'String',
+    '3': 'Integer',
+    '4': 'Parameter file',
+    '5': 'Reserved',
+    '6': 'Big integer',
+}
+
+
+def _oracle_details(target: dict, detail_type: Literal['database', 'instance', 'parameters'], name_filter: str = '') -> dict:
+    """Return requested fixed V$ view data without allowing arbitrary SQL input."""
+    queries = {
+        'database': 'SELECT * FROM v$database',
+        'instance': 'SELECT * FROM v$instance',
+        'parameters': (
+            "SELECT * FROM v$parameter "
+            "WHERE :name_filter IS NULL OR INSTR(LOWER(name), LOWER(:name_filter)) > 0 "
+            "ORDER BY name"
+        ),
+    }
+    with _oracle_connect(target) as connection:
+        with connection.cursor() as cursor:
+            if detail_type == 'parameters':
+                cursor.execute(queries[detail_type], {'name_filter': name_filter.strip()})
+            else:
+                cursor.execute(queries[detail_type])
+            columns = [column[0].lower() for column in cursor.description]
+            rows = [
+                {column: _oracle_display_value(value) for column, value in zip(columns, row, strict=True)}
+                for row in cursor
+            ]
+    if detail_type == 'parameters' and 'type' in columns:
+        columns = ['type_category' if column == 'type' else column for column in columns]
+        for row in rows:
+            type_code = row.pop('type', None)
+            row['type_category'] = ORACLE_PARAMETER_TYPE_CATEGORIES.get(str(type_code), f'Other ({type_code})')
+    return {'columns': columns, 'rows': rows}
+
+
+def _oracle_sftp_download(target: dict, remote_path: str) -> tuple[str, str]:
+    """Download a diagnostic log with SFTP as the configured Oracle OS owner."""
+    owner = (target.get('oracle_os_owner') or '').strip()
+    oracle_base = (target.get('oracle_base') or '').strip()
+    encrypted_password = target.get('oracle_os_password')
+    if not owner or not oracle_base or not encrypted_password:
+        raise ValueError('Configure Oracle OS owner, Oracle OS password, and ORACLE_BASE before viewing logs')
+
+    password = decrypt_data(encrypted_password)
+    askpass_path = None
+    local_path = None
+    keep_temp_file = False
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', prefix='jdeops-ssh-askpass-', delete=False) as askpass_file:
+            askpass_path = askpass_file.name
+            askpass_file.write('#!/bin/sh\nprintf %s "$JDEOPS_SSH_PASSWORD"\n')
+        os.chmod(askpass_path, 0o700)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                'DISPLAY': 'jdeops-ssh',
+                'SSH_ASKPASS': askpass_path,
+                'SSH_ASKPASS_REQUIRE': 'force',
+                'JDEOPS_SSH_PASSWORD': password,
+            }
+        )
+        with tempfile.NamedTemporaryFile(prefix='jdeops-oracle-log-', delete=False) as log_file:
+            local_path = log_file.name
+        result = subprocess.run(
+            [
+                'sftp',
+                '-b', '-',
+                '-o', 'BatchMode=no',
+                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', f'ConnectTimeout={target.get("connect_timeout_seconds", 5)}',
+                f'{owner}@{target["host"]}',
+            ],
+            input=f'get "{remote_path}" "{local_path}"\n',
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=environment,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or 'SFTP download failed').strip()[:300])
+        with open(local_path, 'rb') as log_file:
+            log_file.seek(0, os.SEEK_END)
+            log_file.seek(max(log_file.tell() - 256 * 1024, 0))
+            keep_temp_file = True
+            return local_path, log_file.read().decode('utf-8', errors='replace')
+    finally:
+        if askpass_path:
+            try:
+                os.unlink(askpass_path)
+            except FileNotFoundError:
+                pass
+        if local_path and not keep_temp_file:
+            try:
+                os.unlink(local_path)
+            except FileNotFoundError:
+                pass
+
+
+def _oracle_log(target: dict, log_type: Literal['alert', 'listener']) -> dict:
+    """Locate and return the newest tail of the requested Oracle diagnostic log."""
+    oracle_base = (target.get('oracle_base') or '').strip()
+    if log_type == 'alert':
+        with _oracle_connect(target) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT d.db_unique_name, i.instance_name FROM v$database d CROSS JOIN v$instance i')
+                db_unique_name, instance_name = cursor.fetchone()
+        path = posixpath.join(
+            oracle_base,
+            'diag',
+            'rdbms',
+            str(db_unique_name),
+            str(instance_name),
+            'trace',
+            f'alert_{instance_name}.log',
+        )
+    else:
+        host_name = str(target['host']).split('.')[0]
+        path = posixpath.join(oracle_base, 'diag', 'tnslsnr', host_name, 'listener', 'trace', 'listener.log')
+
+    temp_path, content = _oracle_sftp_download(target, path)
+    return {'log_type': log_type, 'path': path, 'content': content, 'temp_path': temp_path}
+
+
+def _oracle_trace_log(target: dict, trace_path: str) -> dict:
+    """Download a trace file referenced by an alert log, limited to ORACLE_BASE diagnostics."""
+    oracle_base = (target.get('oracle_base') or '').strip()
+    allowed_root = posixpath.normpath(posixpath.join(oracle_base, 'diag'))
+    normalized_path = posixpath.normpath(trace_path)
+    try:
+        is_within_diagnostics = posixpath.commonpath([allowed_root, normalized_path]) == allowed_root
+    except ValueError:
+        is_within_diagnostics = False
+    if not is_within_diagnostics or not normalized_path.lower().endswith(('.trc', '.trm')):
+        raise ValueError('Only .trc or .trm files below ORACLE_BASE/diag can be opened')
+    temp_path, content = _oracle_sftp_download(target, normalized_path)
+    return {'log_type': 'trace', 'path': normalized_path, 'content': content, 'temp_path': temp_path}
+
+
+def _oracle_kill_inactive_sessions(target: dict, sessions: list[OracleSessionSelection]) -> dict:
+    """Recheck selected RAC sessions and kill only those still inactive."""
+    killed = []
+    skipped = []
+    with _oracle_connect(target) as connection:
+        with connection.cursor() as cursor:
+            for session in sessions:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM gv$session
+                    WHERE inst_id = :inst_id
+                      AND sid = :sid
+                      AND serial# = :serial_number
+                      AND type = 'USER'
+                      AND username IS NOT NULL
+                    """,
+                    {
+                        'inst_id': session.inst_id,
+                        'sid': session.sid,
+                        'serial_number': session.serial_number,
+                    },
+                )
+                row = cursor.fetchone()
+                reference = f'{session.inst_id}:{session.sid}:{session.serial_number}'
+                if row is None:
+                    skipped.append({'session': reference, 'reason': 'Session no longer exists'})
+                    continue
+                if row[0] != 'INACTIVE':
+                    skipped.append({'session': reference, 'reason': f"Session is {row[0]}, not INACTIVE"})
+                    continue
+                cursor.execute(
+                    f"ALTER SYSTEM KILL SESSION '{session.sid},{session.serial_number},@{session.inst_id}' IMMEDIATE"
+                )
+                killed.append(reference)
+    return {'killed': killed, 'skipped': skipped}
+
+
+ORACLE_PATCH_LEVEL_QUERY = """
+SELECT
+    patch_id,
+    patch_type,
+    action,
+    status,
+    TO_CHAR(action_time, 'YYYY-MM-DD HH24:MI:SS') AS action_time,
+    source_version,
+    target_version,
+    description
+FROM dba_registry_sqlpatch
+ORDER BY action_time DESC
+"""
+
+
+def _oracle_patch_level(target: dict) -> dict:
+    """Return SQL patch inventory for one configured Oracle target."""
+    with _oracle_connect(target) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(ORACLE_PATCH_LEVEL_QUERY)
+            columns = [column[0].lower() for column in cursor.description]
+            patch_rows = [dict(zip(columns, row, strict=True)) for row in cursor]
+
+    public_target = _public_oracle_target(target)
+    rows = [
+        {
+            'database_name': public_target['name'],
+            'service_name': public_target['service_name'],
+            'protocol': public_target['protocol'],
+            'target_id': public_target['id'],
+            **row,
+        }
+        for row in patch_rows
+    ]
+    return {'target': public_target, 'rows': rows}
+
+
+def _oracle_inventory_health(target: dict) -> dict:
+    """Return the dashboard health and capacity snapshot for one Oracle target."""
+    result = _oracle_monitor_status(target)
+    result.update(
+        {
+            'overall_status': 'UP' if result['listener_status'] == 'UP' and result['database_status'] == 'UP' else 'DOWN',
+            'total_sessions': None,
+            'active_sessions': None,
+            'inactive_sessions': None,
+            'total_processes': None,
+        }
+    )
+    if result['database_status'] != 'UP':
+        return result
+
+    try:
+        with _oracle_connect(target) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_sessions,
+                        SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active_sessions,
+                        SUM(CASE WHEN status = 'INACTIVE' THEN 1 ELSE 0 END) AS inactive_sessions
+                    FROM gv$session
+                    WHERE type = 'USER' AND username IS NOT NULL
+                    """
+                )
+                total_sessions, active_sessions, inactive_sessions = cursor.fetchone()
+                cursor.execute('SELECT COUNT(*) FROM gv$process')
+                total_processes = cursor.fetchone()[0]
+        result.update(
+            {
+                'total_sessions': total_sessions,
+                'active_sessions': active_sessions or 0,
+                'inactive_sessions': inactive_sessions or 0,
+                'total_processes': total_processes,
+            }
+        )
+    except Exception as exc:
+        result['overall_status'] = 'DEGRADED'
+        result['detail'] = f"Capacity query failed: {str(exc)[:180]}"
+    return result
+
+
+ORACLE_BACKUP_STATUS_QUERY = """
+SELECT
+    input_type,
+    status,
+    TO_CHAR(start_time, 'YYYY-MM-DD HH24:MI:SS') AS start_time,
+    TO_CHAR(end_time, 'YYYY-MM-DD HH24:MI:SS') AS end_time,
+    elapsed_seconds,
+    output_bytes_display,
+    time_taken_display,
+    compression_ratio
+FROM v$rman_backup_job_details
+ORDER BY start_time DESC
+FETCH FIRST 100 ROWS ONLY
+"""
+
+
+def _oracle_backup_status(target: dict) -> dict:
+    """Return recent RMAN backup-job history for one Oracle target."""
+    with _oracle_connect(target) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(ORACLE_BACKUP_STATUS_QUERY)
+            columns = [column[0].lower() for column in cursor.description]
+            backup_rows = [dict(zip(columns, row, strict=True)) for row in cursor]
+    public_target = _public_oracle_target(target)
+    return {
+        'rows': [
+            {
+                'database_name': public_target['name'],
+                'service_name': public_target['service_name'],
+                'protocol': public_target['protocol'],
+                'target_id': public_target['id'],
+                **row,
+            }
+            for row in backup_rows
+        ]
+    }
 
 
 ############################
@@ -123,6 +797,396 @@ async def export_config(user=Depends(get_admin_user)):
 @router.get('/namespace/{namespace}', response_model=dict)
 async def get_config_namespace(namespace: str, user=Depends(get_admin_user)):
     return await Config.get_namespace(namespace)
+
+
+############################
+# Oracle Monitoring Targets
+############################
+
+
+@router.get('/oracle-monitor/targets', response_model=dict)
+async def get_oracle_monitor_targets(user=Depends(get_admin_user)):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    return {'targets': [_public_oracle_target(target) for target in targets]}
+
+
+@router.get('/oracle-monitor/targets/monitoring', response_model=dict)
+async def get_oracle_monitoring_targets(user=Depends(get_verified_user)):
+    """Return non-secret target metadata for the on-demand monitoring card."""
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    return {'targets': [_public_oracle_target(target) for target in sorted(targets, key=_oracle_target_sort_key)]}
+
+
+@router.post('/oracle-monitor/targets', response_model=dict)
+async def set_oracle_monitor_targets(form_data: OracleMonitorTargetsForm, user=Depends(get_admin_user)):
+    existing_targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    existing_by_id = {target.get('id'): target for target in existing_targets if target.get('id')}
+    targets = []
+
+    for form_target in form_data.targets:
+        target = form_target.model_dump()
+        target_id = target['id'] or str(uuid4())
+        existing = existing_by_id.get(target_id, {})
+        password = target.pop('password')
+        oracle_os_password = target.pop('oracle_os_password')
+        target['id'] = target_id
+        target['password'] = encrypt_data(password) if password else existing.get('password')
+        target['oracle_os_password'] = (
+            encrypt_data(oracle_os_password) if oracle_os_password else existing.get('oracle_os_password')
+        )
+        targets.append(target)
+
+    await Config.upsert({ORACLE_MONITOR_TARGETS_CONFIG_KEY: targets})
+    return {'targets': [_public_oracle_target(target) for target in targets]}
+
+
+@router.post('/oracle-monitor/status', response_model=dict)
+async def get_oracle_monitor_status(user=Depends(get_verified_user)):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    results = await asyncio.gather(*[asyncio.to_thread(_oracle_monitor_status, target) for target in targets])
+    response = {'targets': sorted(results, key=_oracle_target_sort_key)}
+    await asyncio.gather(
+        *[
+            _record_oracle_monitor_history(
+                'health_check', result, str(user.id), target=target, error_detail=result.get('detail')
+            )
+            for target, result in zip(targets, results, strict=True)
+        ]
+    )
+    return response
+
+
+@router.post('/oracle-monitor/status/{target_id}', response_model=dict)
+async def get_oracle_monitor_target_status(target_id: str, user=Depends(get_verified_user)):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    target = next((item for item in targets if item.get('id') == target_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail='Configured Oracle monitoring target not found')
+    response = await asyncio.to_thread(_oracle_monitor_status, target)
+    await _record_oracle_monitor_history(
+        'check_now', response, str(user.id), target=target, error_detail=response.get('detail')
+    )
+    return response
+
+
+@router.post('/oracle-monitor/details/{target_id}/parameters', response_model=dict)
+async def get_oracle_target_parameters(
+    target_id: str,
+    form_data: OracleParameterFilter,
+    user=Depends(get_verified_user),
+):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    target = next((item for item in targets if item.get('id') == target_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail='Configured Oracle monitoring target not found')
+    try:
+        response = await asyncio.to_thread(_oracle_details, target, 'parameters', form_data.name_filter)
+        await _record_oracle_monitor_history('parameters', response, str(user.id), target=target)
+        return response
+    except Exception as exc:
+        log.warning('Oracle parameter details query failed for %s: %s', target_id, exc)
+        await _record_oracle_monitor_history(
+            'parameters', {}, str(user.id), target=target, error_detail=str(exc)[:180]
+        )
+        raise HTTPException(status_code=502, detail=f'Parameter query failed: {str(exc)[:180]}') from exc
+
+
+@router.post('/oracle-monitor/details/{target_id}/{detail_type}', response_model=dict)
+async def get_oracle_target_details(
+    target_id: str,
+    detail_type: Literal['database', 'instance'],
+    user=Depends(get_verified_user),
+):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    target = next((item for item in targets if item.get('id') == target_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail='Configured Oracle monitoring target not found')
+    try:
+        response = await asyncio.to_thread(_oracle_details, target, detail_type)
+        await _record_oracle_monitor_history(f'{detail_type}_details', response, str(user.id), target=target)
+        return response
+    except Exception as exc:
+        log.warning('Oracle %s details query failed for %s: %s', detail_type, target_id, exc)
+        await _record_oracle_monitor_history(
+            f'{detail_type}_details', {}, str(user.id), target=target, error_detail=str(exc)[:180]
+        )
+        raise HTTPException(status_code=502, detail=f'{detail_type.title()} details query failed: {str(exc)[:180]}') from exc
+
+
+@router.post('/oracle-monitor/logs/{target_id}/log/{log_type}', response_model=dict)
+async def get_oracle_target_log(
+    target_id: str,
+    log_type: Literal['alert', 'listener'],
+    user=Depends(get_verified_user),
+):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    target = next((item for item in targets if item.get('id') == target_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail='Configured Oracle monitoring target not found')
+    try:
+        result = await asyncio.to_thread(_oracle_log, target, log_type)
+        log_id = str(uuid4())
+        ORACLE_LOG_DOWNLOADS[log_id] = {
+            'path': result.pop('temp_path'),
+            'owner_id': str(user.id),
+            'filename': os.path.basename(result['path']) or f'{log_type}.log',
+        }
+        return {**result, 'log_id': log_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        log.warning('Oracle %s log retrieval failed for %s: %s', log_type, target_id, exc)
+        raise HTTPException(status_code=502, detail=f'{log_type.title()} log retrieval failed: {str(exc)[:220]}') from exc
+
+
+@router.post('/oracle-monitor/logs/{target_id}/trace', response_model=dict)
+async def get_oracle_target_trace_log(
+    target_id: str,
+    form_data: OracleTraceFileRequest,
+    user=Depends(get_verified_user),
+):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    target = next((item for item in targets if item.get('id') == target_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail='Configured Oracle monitoring target not found')
+    try:
+        result = await asyncio.to_thread(_oracle_trace_log, target, form_data.path)
+        log_id = str(uuid4())
+        ORACLE_LOG_DOWNLOADS[log_id] = {
+            'path': result.pop('temp_path'),
+            'owner_id': str(user.id),
+            'filename': os.path.basename(result['path']) or 'oracle-trace.trc',
+        }
+        return {**result, 'log_id': log_id}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        log.warning('Oracle trace log retrieval failed for %s: %s', target_id, exc)
+        raise HTTPException(status_code=502, detail=f'Trace log retrieval failed: {str(exc)[:220]}') from exc
+
+
+@router.get('/oracle-monitor/logs/download/{log_id}')
+async def download_oracle_target_log(log_id: str, user=Depends(get_verified_user)):
+    log_download = ORACLE_LOG_DOWNLOADS.get(log_id)
+    if log_download is None or log_download['owner_id'] != str(user.id):
+        raise HTTPException(status_code=404, detail='Temporary log download not found')
+    if not os.path.exists(log_download['path']):
+        ORACLE_LOG_DOWNLOADS.pop(log_id, None)
+        raise HTTPException(status_code=404, detail='Temporary log file is no longer available')
+    return FileResponse(log_download['path'], filename=log_download['filename'], media_type='text/plain')
+
+
+@router.delete('/oracle-monitor/logs/{log_id}', response_model=dict)
+async def delete_oracle_target_log(log_id: str, user=Depends(get_verified_user)):
+    log_download = ORACLE_LOG_DOWNLOADS.get(log_id)
+    if log_download is None or log_download['owner_id'] != str(user.id):
+        raise HTTPException(status_code=404, detail='Temporary log download not found')
+    ORACLE_LOG_DOWNLOADS.pop(log_id, None)
+    try:
+        os.unlink(log_download['path'])
+    except FileNotFoundError:
+        pass
+    return {'deleted': True}
+
+
+@router.get('/oracle-monitor/history', response_model=dict)
+async def get_oracle_monitor_history(
+    report_type: str | None = None,
+    target_id: str | None = None,
+    limit: int = 100,
+    user=Depends(get_verified_user),
+):
+    """Read persisted, non-secret monitoring snapshots for future chat and UI use."""
+    safe_limit = min(max(limit, 1), 500)
+    filters = []
+    params = {'limit': safe_limit}
+    if report_type:
+        filters.append('report_type = :report_type')
+        params['report_type'] = report_type
+    if target_id:
+        filters.append('target_id = :target_id')
+        params['target_id'] = target_id
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ''
+    async with get_async_db() as db:
+        await db.execute(text(ORACLE_MONITOR_HISTORY_DDL))
+        result = await db.execute(
+            text(
+                f"""
+                SELECT id, captured_at, captured_by, report_type, target_id, target_name,
+                       service_name, protocol, success, error_detail, payload_json
+                FROM oracle_monitor_history
+                {where_clause}
+                ORDER BY captured_at DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        )
+        rows = [dict(row) for row in result.mappings()]
+    for row in rows:
+        row['payload'] = json.loads(row.pop('payload_json'))
+    return {'rows': rows}
+
+
+@router.post('/oracle-monitor/current-usage/{target_id}', response_model=dict)
+async def get_oracle_current_usage(target_id: str, user=Depends(get_verified_user)):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    target = next((item for item in targets if item.get('id') == target_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail='Configured Oracle monitoring target not found')
+    if target.get('protocol', 'TCP').upper() == 'TCPS':
+        raise HTTPException(status_code=400, detail='Current usage excludes TCPS targets')
+    try:
+        response = await asyncio.to_thread(_oracle_current_usage, target)
+        await _record_oracle_monitor_history('current_usage', response, str(user.id), target=target)
+        return response
+    except Exception as exc:
+        log.warning('Oracle current usage query failed for %s: %s', target_id, exc)
+        await _record_oracle_monitor_history(
+            'current_usage', {}, str(user.id), target=target, error_detail=str(exc)[:180]
+        )
+        raise HTTPException(status_code=502, detail=f'Current usage query failed: {str(exc)[:180]}') from exc
+
+
+@router.post('/oracle-monitor/current-usage/{target_id}/kill', response_model=dict)
+async def kill_oracle_inactive_sessions(
+    target_id: str,
+    form_data: OracleSessionKillRequest,
+    user=Depends(get_verified_user),
+):
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    target = next((item for item in targets if item.get('id') == target_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail='Configured Oracle monitoring target not found')
+    if target.get('protocol', 'TCP').upper() == 'TCPS':
+        raise HTTPException(status_code=400, detail='Current usage excludes TCPS targets')
+    try:
+        response = await asyncio.to_thread(_oracle_kill_inactive_sessions, target, form_data.sessions)
+        # Keep a non-secret operator audit record alongside the monitoring
+        # snapshots.  The selected session references are operational data and
+        # make a later chat answer able to explain what was actually killed.
+        await _record_oracle_monitor_history(
+            'session_kill',
+            {
+                'selected': [session.model_dump() for session in form_data.sessions],
+                **response,
+            },
+            str(user.id),
+            target=target,
+        )
+        return response
+    except Exception as exc:
+        log.warning('Oracle session kill failed for %s: %s', target_id, exc)
+        await _record_oracle_monitor_history(
+            'session_kill',
+            {'selected': [session.model_dump() for session in form_data.sessions]},
+            str(user.id),
+            target=target,
+            error_detail=str(exc)[:180],
+        )
+        raise HTTPException(status_code=502, detail=f'Session kill failed: {str(exc)[:180]}') from exc
+
+
+@router.post('/oracle-monitor/patch-level', response_model=dict)
+async def get_oracle_patch_levels(user=Depends(get_verified_user)):
+    """Collect DBA_REGISTRY_SQLPATCH rows from every configured database."""
+    targets = [
+        target
+        for target in (await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or [])
+        if target.get('protocol', 'TCP').upper() != 'TCPS'
+    ]
+    if not targets:
+        return {'rows': [], 'errors': []}
+
+    results = await asyncio.gather(
+        *[asyncio.to_thread(_oracle_patch_level, target) for target in targets],
+        return_exceptions=True,
+    )
+    rows = []
+    errors = []
+    for target, result in zip(targets, results, strict=True):
+        if isinstance(result, Exception):
+            errors.append(
+                {
+                    'database_name': target.get('name', 'Unnamed database'),
+                    'service_name': target.get('service_name', ''),
+                    'detail': str(result)[:180],
+                }
+            )
+        else:
+            rows.extend(result['rows'])
+    rows.sort(key=lambda row: row.get('action_time') or '', reverse=True)
+    rows.sort(key=_oracle_target_sort_key)
+    errors.sort(key=_oracle_target_sort_key)
+    response = {'rows': rows, 'errors': errors}
+    await _record_oracle_monitor_history('patch_level', response, str(user.id))
+    return response
+
+
+@router.post('/oracle-monitor/inventory-health', response_model=dict)
+async def get_oracle_inventory_health(user=Depends(get_verified_user)):
+    """Refresh listener, database, session, and process health for all targets."""
+    targets = await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or []
+    results = await asyncio.gather(
+        *[asyncio.to_thread(_oracle_inventory_health, target) for target in targets],
+        return_exceptions=True,
+    )
+    rows = []
+    for target, result in zip(targets, results, strict=True):
+        if isinstance(result, Exception):
+            rows.append(
+                {
+                    **_public_oracle_target(target),
+                    'listener_status': 'DOWN',
+                    'database_status': 'DOWN',
+                    'overall_status': 'DOWN',
+                    'total_sessions': None,
+                    'active_sessions': None,
+                    'inactive_sessions': None,
+                    'total_processes': None,
+                    'detail': str(result)[:180],
+                }
+            )
+        else:
+            rows.append(result)
+    rows.sort(key=_oracle_target_sort_key)
+    response = {'rows': rows}
+    await _record_oracle_monitor_history('inventory_health', response, str(user.id))
+    return response
+
+
+@router.post('/oracle-monitor/backup-status', response_model=dict)
+async def get_oracle_backup_status(user=Depends(get_verified_user)):
+    """Collect recent RMAN backup-job details from all configured databases."""
+    targets = [
+        target
+        for target in (await Config.get(ORACLE_MONITOR_TARGETS_CONFIG_KEY, []) or [])
+        if target.get('protocol', 'TCP').upper() != 'TCPS'
+    ]
+    results = await asyncio.gather(
+        *[asyncio.to_thread(_oracle_backup_status, target) for target in targets],
+        return_exceptions=True,
+    )
+    rows = []
+    errors = []
+    for target, result in zip(targets, results, strict=True):
+        if isinstance(result, Exception):
+            errors.append(
+                {
+                    'database_name': target.get('name', 'Unnamed database'),
+                    'service_name': target.get('service_name', ''),
+                    'protocol': target.get('protocol', 'TCP'),
+                    'detail': str(result)[:180],
+                }
+            )
+        else:
+            rows.extend(result['rows'])
+    rows.sort(key=lambda row: row.get('start_time') or '', reverse=True)
+    rows.sort(key=_oracle_target_sort_key)
+    errors.sort(key=_oracle_target_sort_key)
+    response = {'rows': rows, 'errors': errors}
+    await _record_oracle_monitor_history('backup_status', response, str(user.id))
+    return response
 
 
 ############################

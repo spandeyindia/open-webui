@@ -1,7 +1,6 @@
 <script lang="ts">
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Plus from '$lib/components/icons/Plus.svelte';
-	import { WEBUI_BASE_URL } from '$lib/constants';
 
 	let selected = '';
 </script>
@@ -29,15 +28,11 @@
 					}
 				}}
 			>
-				<!-- LICENSE covers this Open WebUI app navigation logo.
-				Do not alter, remove, obscure, or replace it except as LICENSE permits:
-				https://docs.openwebui.com/license. -->
-				<img
-					src="{WEBUI_BASE_URL}/static/splash.png"
-					class="size-11 dark:invert p-0.5"
-					alt="logo"
-					draggable="false"
-				/>
+				<span class="flex size-11 items-center justify-center rounded-md bg-[#c74634]" aria-label="Oracle">
+					<svg viewBox="0 0 64 32" class="h-6 w-9" aria-hidden="true">
+						<rect x="7" y="7" width="50" height="18" rx="9" fill="none" stroke="white" stroke-width="5" />
+					</svg>
+				</span>
 			</button>
 		</Tooltip>
 	</div>
@@ -57,15 +52,11 @@
 				selected = '';
 			}}
 		>
-			<!-- LICENSE covers this Open WebUI chat navigation logo.
-			Do not alter, remove, obscure, or replace it except as LICENSE permits:
-			https://docs.openwebui.com/license. -->
-			<img
-				src="{WEBUI_BASE_URL}/static/favicon.png"
-				class="size-10 {selected === '' ? 'rounded-2xl' : 'rounded-full'}"
-				alt="logo"
-				draggable="false"
-			/>
+			<span class="flex size-10 items-center justify-center rounded-md bg-[#c74634]" aria-label="Oracle">
+				<svg viewBox="0 0 64 32" class="h-5 w-8" aria-hidden="true">
+					<rect x="7" y="7" width="50" height="18" rx="9" fill="none" stroke="white" stroke-width="5" />
+				</svg>
+			</span>
 		</button>
 	</div>
 

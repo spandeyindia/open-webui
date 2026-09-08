@@ -157,6 +157,7 @@ from open_webui.routers import (
     functions,
     groups,
     images,
+    jdeops,
     knowledge,
     memories,
     models,
@@ -375,6 +376,13 @@ async def lifespan(app: FastAPI):
 
     if SAFE_MODE:
         await Functions.deactivate_all_functions()
+
+    # Make the non-secret DbOps monitoring history available as a shared,
+    # read-only chat tool.  If no administrator exists yet, provisioning is
+    # deferred until the next application start.
+    from open_webui.utils.dbops_knowledge import ensure_dbops_monitoring_knowledge_tool
+
+    await ensure_dbops_monitoring_knowledge_tool()
 
     # This should be blocking (sync) so functions are not deactivated on first /get_models calls
     # when the first user lands on the / route.
@@ -824,6 +832,7 @@ app.include_router(openai.router, prefix='/openai', tags=['openai'])
 app.include_router(pipelines.router, prefix='/api/v1/pipelines', tags=['pipelines'])
 app.include_router(tasks.router, prefix='/api/v1/tasks', tags=['tasks'])
 app.include_router(images.router, prefix='/api/v1/images', tags=['images'])
+app.include_router(jdeops.router, prefix='/api/v1/jdeops', tags=['jdeops'])
 
 app.include_router(audio.router, prefix='/api/v1/audio', tags=['audio'])
 app.include_router(retrieval.router, prefix='/api/v1/retrieval', tags=['retrieval'])

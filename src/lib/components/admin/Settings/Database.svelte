@@ -9,6 +9,7 @@
 	import { getAllUserChats } from '$lib/apis/chats';
 	import { getAllUsers } from '$lib/apis/users';
 	import { exportConfig, importConfig } from '$lib/apis/configs';
+	import OracleMonitor from './OracleMonitor.svelte';
 	import AdminSettingRow from './AdminSettingRow.svelte';
 	import AdminSettingSection from './AdminSettingSection.svelte';
 
@@ -116,6 +117,10 @@
 					{$i18n.t('Export')}
 				</button>
 			</AdminSettingRow>
+		</AdminSettingSection>
+
+		<AdminSettingSection title="Oracle 19c monitoring">
+			<OracleMonitor mode="admin" />
 		</AdminSettingSection>
 
 		{#if $config?.features.enable_admin_export ?? true}

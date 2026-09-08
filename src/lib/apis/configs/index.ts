@@ -58,6 +58,199 @@ export const exportConfig = async (token: string) => {
 	return res;
 };
 
+export const getOracleMonitorTargets = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/targets`, {
+		method: 'GET',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleMonitoringTargets = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/targets/monitoring`, {
+		method: 'GET',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const setOracleMonitorTargets = async (token: string, targets: object[]) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/targets`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			Authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({ targets })
+	});
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleMonitorStatus = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/status`, {
+		method: 'POST',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleMonitorTargetStatus = async (token: string, targetId: string) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/status/${encodeURIComponent(targetId)}`,
+		{
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}` }
+		}
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleTargetDetails = async (
+	token: string,
+	targetId: string,
+	detailType: 'database' | 'instance'
+) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/details/${encodeURIComponent(targetId)}/${detailType}`,
+		{ method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleTargetParameters = async (token: string, targetId: string, nameFilter = '') => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/details/${encodeURIComponent(targetId)}/parameters`,
+		{
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name_filter: nameFilter })
+		}
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleTargetLog = async (
+	token: string,
+	targetId: string,
+	logType: 'alert' | 'listener'
+) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/logs/${encodeURIComponent(targetId)}/log/${logType}`,
+		{ method: 'POST', headers: { Authorization: `Bearer ${token}` } }
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleTargetTraceLog = async (token: string, targetId: string, path: string) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/logs/${encodeURIComponent(targetId)}/trace`,
+		{
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path })
+		}
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const downloadOracleTargetLog = async (token: string, logId: string) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/logs/download/${encodeURIComponent(logId)}`,
+		{ headers: { Authorization: `Bearer ${token}` } }
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return { blob: await res.blob(), filename: res.headers.get('content-disposition')?.match(/filename="?([^";]+)"?/)?.[1] ?? 'oracle-log.log' };
+};
+
+export const deleteOracleTargetLog = async (token: string, logId: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/logs/${encodeURIComponent(logId)}`, {
+		method: 'DELETE',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+
+	if (!res.ok && res.status !== 404) throw (await res.json()).detail;
+};
+
+export const getOracleCurrentUsage = async (token: string, targetId: string) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/current-usage/${encodeURIComponent(targetId)}`,
+		{
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}` }
+		}
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const killOracleInactiveSessions = async (
+	token: string,
+	targetId: string,
+	sessions: { inst_id: number; sid: number; serial_number: number }[]
+) => {
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/configs/oracle-monitor/current-usage/${encodeURIComponent(targetId)}/kill`,
+		{
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ sessions })
+		}
+	);
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOraclePatchLevels = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/patch-level`, {
+		method: 'POST',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleInventoryHealth = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/inventory-health`, {
+		method: 'POST',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
+export const getOracleBackupStatus = async (token: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/configs/oracle-monitor/backup-status`, {
+		method: 'POST',
+		headers: { Authorization: `Bearer ${token}` }
+	});
+
+	if (!res.ok) throw (await res.json()).detail;
+	return res.json();
+};
+
 export const getConnectionsConfig = async (token: string) => {
 	let error = null;
 
